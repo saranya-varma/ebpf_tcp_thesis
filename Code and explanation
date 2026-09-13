@@ -1,0 +1,1806 @@
+🎓 Project
+Design and Evaluation of an eBPF-Based TCP Performance Monitoring Framework for Containerized and Kubernetes Environments Under Variable Network Conditions
+Final architecture
+                    APPLICATION WORKLOADS
+                           │
+          ┌────────────────┼────────────────┐
+          ▼                ▼                ▼
+      Native Linux      Docker          Kubernetes
+          │                │                │
+          └────────────────┼────────────────┘
+                           ▼
+                    Linux TCP Stack
+                           │
+                    eBPF Hooks
+                           │
+          ┌────────────────┼────────────────┐
+          ▼                ▼                ▼
+      Connections      States        Retransmissions
+                           │
+                           ▼
+                       Ring Buffer
+                           │
+                           ▼
+                    User-Space Loader
+                           │
+                           ▼
+                       CSV Results
+                           │
+                           ▼
+                  Research Evaluation
+PART 1 — Project structure
+
+Create the main project:
+
+mkdir -p ~/ebpf_tcp_thesis/{bpf,user,include,data,experiments,docker,kubernetes}
+cd ~/ebpf_tcp_thesis
+
+You will eventually have:
+
+ebpf_tcp_thesis/
+│
+├── bpf/
+│   └── tcp_monitor.bpf.c
+│
+├── user/
+│   └── tcp_monitor.c
+│
+├── include/
+│   └── tcp_monitor.h
+│
+├── data/
+│   └── results.csv
+│
+├── experiments/
+│   ├── baseline.sh
+│   ├── delay.sh
+│   └── loss.sh
+│
+├── docker/
+│   ├── Dockerfile
+│   └── docker-compose.yml
+│
+├── kubernetes/
+│   ├── client.yaml
+│   ├── server.yaml
+│   └── service.yaml
+│
+└── Makefile
+PART 2 — Generate vmlinux.h
+
+Go into the project folder:
+
+cd ~/ebpf_tcp_thesis
+
+Generate:
+
+bpftool btf dump file /sys/kernel/btf/vmlinux format c > vmlinux.h
+What happens here?
+Your Linux Kernel
+       │
+       ▼
+Kernel BTF Information
+       │
+       ▼
+bpftool
+       │
+       ▼
+vmlinux.h
+
+vmlinux.h contains Linux kernel data type definitions needed by your eBPF program.
+
+PART 3 — Shared header file
+
+Create:
+
+nano include/tcp_monitor.h
+
+Paste:
+
+#ifndef TCP_MONITOR_H
+#define TCP_MONITOR_H
+
+/*
+ * Event types.
+ *
+ * These numbers allow user space to understand
+ * what type of event was generated.
+ */
+enum event_type {
+    EVENT_CONNECT = 1,
+    EVENT_RETRANSMIT = 2,
+};
+
+
+/*
+ * This structure is shared between:
+ *
+ * Kernel-space eBPF program
+ *          AND
+ * User-space program
+ */
+struct event {
+
+    /* Type of event */
+    unsigned int type;
+
+    /* Process ID */
+    unsigned int pid;
+
+    /* Timestamp in nanoseconds */
+    unsigned long long timestamp_ns;
+
+    /* Name of the process */
+    char comm[16];
+};
+
+#endif
+Understanding every important line
+Header guard
+#ifndef TCP_MONITOR_H
+#define TCP_MONITOR_H
+
+This prevents the header from being included multiple times.
+
+Think:
+
+Has TCP_MONITOR_H already been loaded?
+
+NO
+ ↓
+Load this file
+
+YES
+ ↓
+Skip it
+
+At the end:
+
+#endif
+
+closes the protection.
+
+Event types
+enum event_type {
+
+An enum creates named numerical values.
+
+We define:
+
+EVENT_CONNECT = 1,
+EVENT_RETRANSMIT = 2,
+
+So internally:
+
+EVENT_CONNECT      → 1
+EVENT_RETRANSMIT   → 2
+
+Why?
+
+Because the same ring buffer will eventually carry multiple kinds of events.
+
+Example:
+
+Kernel sends:
+
+Type = 1
+PID = 5000
+
+User program understands:
+
+Type 1 = Connection event
+The event structure
+struct event {
+
+This is the packet of information travelling from:
+
+eBPF Kernel Program
+        │
+        ▼
+    Ring Buffer
+        │
+        ▼
+ User-Space Program
+Event type
+unsigned int type;
+
+Stores:
+
+1 → CONNECT
+2 → RETRANSMIT
+PID
+unsigned int pid;
+
+Stores the process ID.
+
+Example:
+
+curl PID = 4567
+Timestamp
+unsigned long long timestamp_ns;
+
+Stores time in nanoseconds.
+
+ns means:
+
+nanoseconds
+
+Later this helps us calculate:
+
+Event timing
+Connection frequency
+Performance trends
+Process name
+char comm[16];
+
+Stores the Linux process name.
+
+For example:
+
+curl
+iperf3
+python
+firefox
+PART 4 — Kernel-space eBPF program
+
+Create:
+
+nano bpf/tcp_monitor.bpf.c
+
+Paste:
+
+#include "vmlinux.h"
+
+#include "../include/tcp_monitor.h"
+
+#include <bpf/bpf_helpers.h>
+#include <bpf/bpf_tracing.h>
+
+
+/*
+ * GPL license declaration.
+ *
+ * Some eBPF helpers require a GPL-compatible license.
+ */
+char LICENSE[] SEC("license") = "GPL";
+
+
+/*
+ * Ring Buffer
+ *
+ * Used to send events from kernel space
+ * to user space.
+ */
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 256 * 1024);
+} events SEC(".maps");
+
+
+/*
+ * Function 1:
+ *
+ * Monitor connect() system calls.
+ *
+ * Hook:
+ * tracepoint/syscalls/sys_enter_connect
+ */
+SEC("tracepoint/syscalls/sys_enter_connect")
+int monitor_connect(void *ctx)
+{
+    /*
+     * Pointer to an event.
+     *
+     * This will point to memory reserved
+     * inside the Ring Buffer.
+     */
+    struct event *e;
+
+
+    /*
+     * Ask the Ring Buffer for enough memory
+     * to store one complete event.
+     */
+    e = bpf_ringbuf_reserve(
+        &events,
+        sizeof(*e),
+        0
+    );
+
+
+    /*
+     * If no memory is available,
+     * safely stop this event.
+     */
+    if (!e)
+        return 0;
+
+
+    /*
+     * Set event type.
+     */
+    e->type = EVENT_CONNECT;
+
+
+    /*
+     * Get current PID.
+     *
+     * bpf_get_current_pid_tgid() returns
+     * PID/TGID information.
+     *
+     * >> 32 extracts the upper 32 bits.
+     */
+    e->pid = bpf_get_current_pid_tgid() >> 32;
+
+
+    /*
+     * Get current timestamp.
+     *
+     * Returned in nanoseconds.
+     */
+    e->timestamp_ns = bpf_ktime_get_ns();
+
+
+    /*
+     * Get current process name.
+     *
+     * Store it in:
+     *
+     * e->comm
+     */
+    bpf_get_current_comm(
+        e->comm,
+        sizeof(e->comm)
+    );
+
+
+    /*
+     * Publish the event.
+     *
+     * After this, user space can receive it.
+     */
+    bpf_ringbuf_submit(e, 0);
+
+
+    return 0;
+}
+
+
+/*
+ * Function 2:
+ *
+ * Monitor TCP retransmission events.
+ *
+ * The Linux tcp_retransmit_skb tracepoint
+ * is used when available on the system.
+ */
+SEC("tracepoint/tcp/tcp_retransmit_skb")
+int monitor_retransmit(void *ctx)
+{
+    struct event *e;
+
+
+    /*
+     * Reserve Ring Buffer memory.
+     */
+    e = bpf_ringbuf_reserve(
+        &events,
+        sizeof(*e),
+        0
+    );
+
+
+    /*
+     * Ring Buffer full?
+     *
+     * Exit safely.
+     */
+    if (!e)
+        return 0;
+
+
+    /*
+     * Mark event as retransmission.
+     */
+    e->type = EVENT_RETRANSMIT;
+
+
+    /*
+     * Get PID of currently running context.
+     */
+    e->pid = bpf_get_current_pid_tgid() >> 32;
+
+
+    /*
+     * Get timestamp.
+     */
+    e->timestamp_ns = bpf_ktime_get_ns();
+
+
+    /*
+     * Get process name.
+     */
+    bpf_get_current_comm(
+        e->comm,
+        sizeof(e->comm)
+    );
+
+
+    /*
+     * Send event to user space.
+     */
+    bpf_ringbuf_submit(e, 0);
+
+
+    return 0;
+}
+Understand the eBPF program
+
+The most important concept is this:
+
+                KERNEL SPACE
+
+Application
+     │
+     ▼
+connect()
+     │
+     ▼
+Linux Tracepoint
+     │
+     ▼
+monitor_connect()
+     │
+     ▼
+Create event
+     │
+     ▼
+Ring Buffer
+     │
+     │
+══════════════════════════════════
+     │
+     ▼
+                USER SPACE
+
+tcp_monitor.c
+#include "vmlinux.h"
+#include "vmlinux.h"
+
+This gives the BPF program access to kernel type definitions.
+
+bpf_helpers.h
+#include <bpf/bpf_helpers.h>
+
+Provides important eBPF definitions and helpers.
+
+For example:
+
+SEC()
+
+and BPF helper declarations.
+
+License
+char LICENSE[] SEC("license") = "GPL";
+
+This creates a special section:
+
+license
+
+containing:
+
+GPL
+
+The kernel checks this when loading the BPF program.
+
+Ring Buffer
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 256 * 1024);
+} events SEC(".maps");
+
+This creates a communication channel.
+
+Think of it as:
+
+KERNEL SPACE
+
+eBPF Program
+      │
+      ▼
+┌─────────────────┐
+│   RING BUFFER   │
+│                 │
+│ Event 1         │
+│ Event 2         │
+│ Event 3         │
+└─────────────────┘
+      │
+      ▼
+USER SPACE
+The hook
+SEC("tracepoint/syscalls/sys_enter_connect")
+
+This means:
+
+Run the following function whenever a process enters the connect() system call.
+
+Example:
+
+curl https://example.com
+
+Simplified flow:
+
+curl
+ │
+ ▼
+connect()
+ │
+ ▼
+sys_enter_connect
+ │
+ ▼
+YOUR eBPF PROGRAM
+
+⚠️ Important research detail: connect() can also be used for non-TCP sockets. In later stages we will improve the framework so it can distinguish and focus specifically on TCP flows.
+
+Function declaration
+int monitor_connect(void *ctx)
+
+This function executes when the tracepoint fires.
+
+The name:
+
+monitor_connect
+
+is chosen by us.
+
+The kernel does not care about this name.
+
+What matters is:
+
+SEC("tracepoint/...")
+Reserve memory
+struct event *e;
+
+This creates a pointer.
+
+Then:
+
+e = bpf_ringbuf_reserve(
+    &events,
+    sizeof(*e),
+    0
+);
+
+means:
+
+Ring Buffer, give me enough memory for one struct event.
+
+The memory will contain:
+
+type
+PID
+timestamp
+process name
+Check memory
+if (!e)
+    return 0;
+
+If the Ring Buffer is full:
+
+e = NULL
+
+Then we safely stop.
+
+This is important because eBPF programs must be safe.
+
+Set the event type
+e->type = EVENT_CONNECT;
+
+This stores:
+
+1
+
+which means:
+
+CONNECT EVENT
+Get PID
+e->pid = bpf_get_current_pid_tgid() >> 32;
+
+The helper:
+
+bpf_get_current_pid_tgid()
+
+returns PID/TGID information packed into 64 bits.
+
+Conceptually:
+
+64-bit value
+
+┌─────────────────┬─────────────────┐
+│      TGID       │       PID       │
+│   Upper 32      │    Lower 32     │
+└─────────────────┴─────────────────┘
+
+The shift:
+
+>> 32
+
+extracts the upper part.
+
+Timestamp
+e->timestamp_ns = bpf_ktime_get_ns();
+
+This asks the kernel:
+
+What is the current monotonic kernel time?
+
+It returns time in:
+
+nanoseconds
+
+Example:
+
+5,234,567,890 ns
+
+Later, timestamps become important for:
+
+Timing analysis
+Event frequency
+Performance measurements
+Process name
+bpf_get_current_comm(
+    e->comm,
+    sizeof(e->comm)
+);
+
+Gets the currently running process name.
+
+For example:
+
+curl
+
+and stores it in:
+
+e->comm
+Submit the event
+bpf_ringbuf_submit(e, 0);
+
+Before this line:
+
+Event is private/reserved memory
+
+After this line:
+
+Event becomes available to user space
+Retransmission hook
+
+The second function uses:
+
+SEC("tracepoint/tcp/tcp_retransmit_skb")
+
+Conceptually:
+
+TCP sends packet
+       │
+       ▼
+Packet does not get acknowledged
+       │
+       ▼
+TCP decides to retransmit
+       │
+       ▼
+tcp_retransmit_skb event
+       │
+       ▼
+YOUR eBPF PROGRAM
+
+This is particularly important for your thesis because retransmissions can increase under:
+
+Packet loss
+Congestion
+High latency
+Unstable network conditions
+PART 5 — Compile the BPF program
+
+From the project root:
+
+cd ~/ebpf_tcp_thesis
+
+Compile:
+
+clang -g -O2 \
+-target bpf \
+-D__TARGET_ARCH_x86_64 \
+-I . \
+-I include \
+-c bpf/tcp_monitor.bpf.c \
+-o tcp_monitor.bpf.o
+What each command option means
+clang
+
+The compiler.
+
+-g
+
+Include debugging information.
+
+-O2
+
+Optimization level 2.
+
+-target bpf
+
+Very important.
+
+This tells Clang:
+
+Compile this for the eBPF virtual machine.
+
+Not normal x86.
+
+-D__TARGET_ARCH_x86_64
+
+Tells eBPF compilation:
+
+The target architecture is x86_64.
+
+Your system previously showed an x86_64-style setup.
+
+-I .
+
+Look for include files in the current directory.
+
+-I include
+
+Also search:
+
+include/
+-c
+
+Compile only.
+
+Do not link yet.
+
+Output:
+
+tcp_monitor.bpf.o
+
+This is the compiled eBPF object.
+
+PART 6 — Generate the skeleton
+bpftool gen skeleton tcp_monitor.bpf.o > tcp_monitor.skel.h
+
+The skeleton automatically generates functions like:
+
+tcp_monitor_bpf__open()
+tcp_monitor_bpf__load()
+tcp_monitor_bpf__attach()
+tcp_monitor_bpf__destroy()
+
+This saves us from manually writing a large amount of libbpf code.
+
+PART 7 — User-space program
+
+Create:
+
+nano user/tcp_monitor.c
+
+Paste:
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <signal.h>
+#include <unistd.h>
+
+#include <bpf/libbpf.h>
+
+#include "../include/tcp_monitor.h"
+#include "../tcp_monitor.skel.h"
+
+
+/*
+ * This variable controls the monitoring loop.
+ *
+ * 0 = Continue running
+ * 1 = Stop program
+ */
+static volatile sig_atomic_t stop = 0;
+
+
+/*
+ * Signal handler.
+ *
+ * Called when the user presses Ctrl+C.
+ */
+static void handle_signal(int sig)
+{
+    stop = 1;
+}
+
+
+/*
+ * Convert event type into readable text.
+ */
+static const char *event_type_to_string(unsigned int type)
+{
+    switch (type) {
+
+        case EVENT_CONNECT:
+            return "CONNECT";
+
+        case EVENT_RETRANSMIT:
+            return "RETRANSMIT";
+
+        default:
+            return "UNKNOWN";
+    }
+}
+
+
+/*
+ * This function is called automatically
+ * whenever an event arrives from the Ring Buffer.
+ */
+static int handle_event(
+    void *ctx,
+    void *data,
+    size_t data_sz
+)
+{
+    /*
+     * Interpret the raw Ring Buffer data
+     * as our struct event.
+     */
+    const struct event *e = data;
+
+
+    /*
+     * Print event to terminal.
+     */
+    printf(
+        "EVENT=%s | PID=%u | PROCESS=%s | TIME=%llu ns\n",
+
+        event_type_to_string(e->type),
+
+        e->pid,
+
+        e->comm,
+
+        e->timestamp_ns
+    );
+
+
+    return 0;
+}
+
+
+int main(void)
+{
+    /*
+     * Pointer to generated BPF skeleton.
+     */
+    struct tcp_monitor_bpf *skel;
+
+
+    /*
+     * Pointer to user-space Ring Buffer.
+     */
+    struct ring_buffer *rb;
+
+
+    /*
+     * Variable for storing errors.
+     */
+    int err;
+
+
+    /*
+     * Handle Ctrl+C.
+     */
+    signal(SIGINT, handle_signal);
+
+
+    /*
+     * Handle termination signal.
+     */
+    signal(SIGTERM, handle_signal);
+
+
+    /*
+     * STEP 1:
+     *
+     * Open the eBPF object.
+     */
+    skel = tcp_monitor_bpf__open();
+
+    if (!skel) {
+
+        fprintf(
+            stderr,
+            "Failed to open BPF skeleton\n"
+        );
+
+        return 1;
+    }
+
+
+    /*
+     * STEP 2:
+     *
+     * Load eBPF programs into the kernel.
+     */
+    err = tcp_monitor_bpf__load(skel);
+
+    if (err) {
+
+        fprintf(
+            stderr,
+            "Failed to load BPF program: %d\n",
+            err
+        );
+
+        goto cleanup;
+    }
+
+
+    /*
+     * STEP 3:
+     *
+     * Attach eBPF programs to their hooks.
+     */
+    err = tcp_monitor_bpf__attach(skel);
+
+    if (err) {
+
+        fprintf(
+            stderr,
+            "Failed to attach BPF program: %d\n",
+            err
+        );
+
+        goto cleanup;
+    }
+
+
+    /*
+     * STEP 4:
+     *
+     * Create a Ring Buffer reader.
+     *
+     * skel->maps.events
+     * refers to the Ring Buffer created
+     * inside the BPF program.
+     */
+    rb = ring_buffer__new(
+
+        bpf_map__fd(
+            skel->maps.events
+        ),
+
+        handle_event,
+
+        NULL,
+
+        NULL
+    );
+
+
+    if (!rb) {
+
+        fprintf(
+            stderr,
+            "Failed to create Ring Buffer\n"
+        );
+
+        goto cleanup;
+    }
+
+
+    printf("\n");
+    printf("====================================\n");
+    printf(" TCP PERFORMANCE MONITOR STARTED\n");
+    printf("====================================\n\n");
+
+    printf(
+        "Monitoring:\n"
+        "- Connection events\n"
+        "- TCP retransmissions\n\n"
+    );
+
+    printf("Press Ctrl+C to stop.\n\n");
+
+
+    /*
+     * STEP 5:
+     *
+     * Continuously wait for events.
+     */
+    while (!stop) {
+
+        err = ring_buffer__poll(
+            rb,
+            100
+        );
+
+
+        /*
+         * Check for serious errors.
+         */
+        if (err < -1) {
+
+            fprintf(
+                stderr,
+                "Ring Buffer polling error: %d\n",
+                err
+            );
+
+            break;
+        }
+    }
+
+
+    /*
+     * Free Ring Buffer resources.
+     */
+    ring_buffer__free(rb);
+
+
+cleanup:
+
+    /*
+     * Detach and destroy BPF resources.
+     */
+    tcp_monitor_bpf__destroy(skel);
+
+
+    printf("\nTCP Monitor stopped.\n");
+
+    return err < 0 ? -err : 0;
+}
+Understanding the user-space code
+
+This program is responsible for:
+
+1. Open BPF program
+2. Load BPF program
+3. Attach BPF program
+4. Create Ring Buffer reader
+5. Receive events
+6. Print results
+7. Clean up
+Include stdio.h
+#include <stdio.h>
+
+Allows:
+
+printf()
+fprintf()
+Include signal.h
+#include <signal.h>
+
+Allows us to handle:
+
+Ctrl+C
+Include libbpf
+#include <bpf/libbpf.h>
+
+This gives us access to libbpf functions.
+
+Libbpf acts like a bridge:
+
+USER PROGRAM
+      │
+      ▼
+    libbpf
+      │
+      ▼
+ Linux BPF System
+      │
+      ▼
+   eBPF Program
+Skeleton
+#include "../tcp_monitor.skel.h"
+
+This is the automatically generated interface for your BPF program.
+
+Stop variable
+static volatile sig_atomic_t stop = 0;
+
+Initially:
+
+stop = 0
+
+means:
+
+Keep monitoring.
+
+When Ctrl+C happens:
+
+stop = 1
+
+means:
+
+Stop monitoring.
+
+Signal handler
+static void handle_signal(int sig)
+{
+    stop = 1;
+}
+
+When you press:
+
+Ctrl+C
+
+Linux sends:
+
+SIGINT
+
+Then:
+
+handle_signal()
+
+runs.
+
+Convert event type
+static const char *event_type_to_string(unsigned int type)
+
+This function converts:
+
+1 → CONNECT
+2 → RETRANSMIT
+
+For example:
+
+case EVENT_CONNECT:
+    return "CONNECT";
+
+Without this, your output would just show:
+
+TYPE = 1
+
+With it:
+
+EVENT = CONNECT
+
+Much easier to read.
+
+Event handler
+static int handle_event(
+    void *ctx,
+    void *data,
+    size_t data_sz
+)
+
+This is called automatically whenever an event arrives.
+
+The flow:
+
+BPF PROGRAM
+      │
+      ▼
+Ring Buffer
+      │
+      ▼
+handle_event()
+Convert raw data
+const struct event *e = data;
+
+The Ring Buffer gives us raw memory.
+
+We say:
+
+Interpret this raw memory as struct event.
+
+Then we can access:
+
+e->type
+e->pid
+e->comm
+e->timestamp_ns
+Print
+printf(
+    "EVENT=%s | PID=%u | PROCESS=%s | TIME=%llu ns\n",
+
+The placeholders mean:
+
+%s    → String
+%u    → Unsigned integer
+%llu  → Unsigned long long
+
+Example output:
+
+EVENT=CONNECT | PID=12345 | PROCESS=curl | TIME=123456789 ns
+Open skeleton
+skel = tcp_monitor_bpf__open();
+
+This opens the BPF application.
+
+Conceptually:
+
+tcp_monitor.bpf.o
+        │
+        ▼
+Open
+        │
+        ▼
+Create skeleton object
+Load
+err = tcp_monitor_bpf__load(skel);
+
+This loads the eBPF program into the Linux kernel.
+
+The kernel performs verification:
+
+eBPF Program
+      │
+      ▼
+Kernel Verifier
+      │
+      ├── Is it safe?
+      ├── Valid memory access?
+      ├── Valid helper calls?
+      │
+      ▼
+Approved
+Attach
+err = tcp_monitor_bpf__attach(skel);
+
+This connects the program to the hooks.
+
+connect() tracepoint
+        │
+        ▼
+monitor_connect()
+
+and:
+
+TCP retransmission
+        │
+        ▼
+monitor_retransmit()
+Create Ring Buffer
+rb = ring_buffer__new(...)
+
+This creates the user-space side of:
+
+Kernel Ring Buffer
+        │
+        ▼
+User-Space Ring Buffer Reader
+Get the map file descriptor
+bpf_map__fd(skel->maps.events)
+
+Remember our BPF map:
+
+} events SEC(".maps");
+
+The skeleton knows it as:
+
+skel->maps.events
+
+Linux gives access through a file descriptor.
+
+Monitoring loop
+while (!stop)
+
+means:
+
+While stop = 0
+     ↓
+Keep monitoring
+Poll
+ring_buffer__poll(rb, 100);
+
+Means:
+
+Wait for events for up to 100 milliseconds.
+
+If an event arrives:
+
+Ring Buffer
+     │
+     ▼
+handle_event()
+PART 8 — Compile the user program
+
+First:
+
+clang -g -O2 -Wall \
+-I . \
+-I include \
+-c user/tcp_monitor.c \
+-o tcp_monitor.o
+
+Then link it with your libbpf:
+
+clang -g -O2 -Wall \
+tcp_monitor.o \
+/home/varma/libbpf/build/libbpf.a \
+-lelf \
+-lz \
+-o tcp_monitor
+PART 9 — Run the monitor
+
+Terminal 1:
+
+sudo ./tcp_monitor
+
+Expected:
+
+====================================
+ TCP PERFORMANCE MONITOR STARTED
+====================================
+
+Monitoring:
+- Connection events
+- TCP retransmissions
+
+Press Ctrl+C to stop.
+
+Terminal 2:
+
+curl https://example.com
+
+You should see connection events.
+
+PART 10 — Docker implementation
+
+Now we add containers.
+
+Create a simple network server
+
+Create:
+
+nano docker/server.py
+from http.server import HTTPServer, SimpleHTTPRequestHandler
+
+server = HTTPServer(
+    ("0.0.0.0", 8000),
+    SimpleHTTPRequestHandler
+)
+
+print("Server running on port 8000")
+
+server.serve_forever()
+
+For your eBPF monitor, you do not need Python to run the eBPF program. Python here is only a simple example application workload inside the container.
+
+Dockerfile
+
+Create:
+
+nano docker/Dockerfile
+FROM python:3.12-slim
+
+WORKDIR /app
+
+COPY server.py .
+
+EXPOSE 8000
+
+CMD ["python", "server.py"]
+What each line means
+FROM python:3.12-slim
+
+Start with a small Python Linux image.
+
+WORKDIR /app
+
+Set the working directory.
+
+COPY server.py .
+
+Copy the server program.
+
+EXPOSE 8000
+
+Document that the application uses port 8000.
+
+CMD ["python", "server.py"]
+
+Start the application.
+
+Build the container
+cd docker
+docker build -t tcp-test-server .
+
+Run:
+
+docker run -d \
+--name tcp-server \
+-p 8000:8000 \
+tcp-test-server
+
+Now generate traffic:
+
+curl http://localhost:8000
+
+Your host-level eBPF monitor should observe relevant kernel networking activity.
+
+The architecture is:
+
+Docker Container
+       │
+       ▼
+Application
+       │
+       ▼
+Container Network Namespace
+       │
+       ▼
+Linux Kernel
+       │
+       ▼
+eBPF Monitoring
+PART 11 — Kubernetes implementation
+
+For learning and thesis experiments, start with a local Kubernetes environment such as kind.
+
+Server deployment
+
+Create:
+
+nano kubernetes/server.yaml
+apiVersion: apps/v1
+
+kind: Deployment
+
+metadata:
+  name: tcp-server
+
+spec:
+
+  replicas: 1
+
+  selector:
+    matchLabels:
+      app: tcp-server
+
+  template:
+
+    metadata:
+      labels:
+        app: tcp-server
+
+    spec:
+
+      containers:
+
+      - name: server
+
+        image: tcp-test-server:latest
+
+        imagePullPolicy: IfNotPresent
+
+        ports:
+
+        - containerPort: 8000
+Understand the Kubernetes YAML
+apiVersion: apps/v1
+
+The Kubernetes API version.
+
+kind: Deployment
+
+We are creating a Deployment.
+
+A Deployment manages Pods.
+
+replicas: 1
+
+Run:
+
+1 Pod
+
+Later, you can test:
+
+replicas: 5
+
+This becomes interesting for your thesis because more replicas create more network activity.
+
+Kubernetes Service
+
+Create:
+
+nano kubernetes/service.yaml
+apiVersion: v1
+
+kind: Service
+
+metadata:
+  name: tcp-server-service
+
+spec:
+
+  selector:
+    app: tcp-server
+
+  ports:
+
+  - protocol: TCP
+    port: 8000
+    targetPort: 8000
+
+  type: ClusterIP
+
+This creates:
+
+Kubernetes Service
+       │
+       ▼
+TCP Port 8000
+       │
+       ▼
+tcp-server Pod
+Kubernetes client workload
+
+Create:
+
+nano kubernetes/client.yaml
+apiVersion: v1
+
+kind: Pod
+
+metadata:
+  name: tcp-client
+
+spec:
+
+  containers:
+
+  - name: client
+
+    image: curlimages/curl
+
+    command:
+
+    - sleep
+
+    - "3600"
+
+This creates a Pod that stays alive.
+
+Enter it:
+
+kubectl exec -it tcp-client -- sh
+
+Then:
+
+curl http://tcp-server-service:8000
+
+Now:
+
+Client Pod
+     │
+     │ TCP
+     ▼
+Kubernetes Service
+     │
+     ▼
+Server Pod
+
+Your eBPF monitor observes kernel-level networking events on the node where it runs.
+
+PART 12 — Variable network conditions
+
+This is where the research part becomes interesting.
+
+Use:
+
+tc
++
+netem
+Baseline
+
+No artificial impairment.
+
+Delay = 0
+Loss = 0
+Add 50 ms delay
+
+First identify your interface:
+
+ip link
+
+Suppose it is:
+
+wlp1s0
+
+Add delay:
+
+sudo tc qdisc add dev wlp1s0 root netem delay 50ms
+
+Architecture:
+
+Application
+     │
+     ▼
+TCP
+     │
+     ▼
+Network Emulator
+   +50 ms
+     │
+     ▼
+Network
+Add packet loss
+sudo tc qdisc change dev wlp1s0 root \
+netem delay 50ms loss 1%
+
+Now:
+
+50 ms Delay
++
+1% Packet Loss
+
+This may cause:
+
+TCP Retransmissions ↑
+
+which your monitor is designed to observe.
+
+Add jitter
+sudo tc qdisc change dev wlp1s0 root \
+netem delay 50ms 10ms
+
+Meaning approximately:
+
+Average delay: 50 ms
+Variation: 10 ms
+Remove the experiment
+sudo tc qdisc del dev wlp1s0 root
+
+Always remove the experiment configuration afterward.
+
+PART 13 — Research experiment structure
+
+Your thesis can compare:
+
+                 SAME WORKLOAD
+
+                       │
+       ┌───────────────┼────────────────┐
+       ▼               ▼                ▼
+
+    Native           Docker         Kubernetes
+
+       │               │                │
+       └───────────────┼────────────────┘
+                       ▼
+
+                Network Conditions
+
+                       │
+          ┌────────────┼────────────┐
+          ▼            ▼            ▼
+
+       Baseline      Delay         Loss
+
+Measure:
+
+Connection Events
+Retransmissions
+RTT              ← Next module
+Throughput       ← Next module
+CPU Usage
+Memory Usage
+📊 Suggested experiment table
+ID	Environment	Delay	Loss	Metrics
+E1	Native	0 ms	0%	Baseline
+E2	Docker	0 ms	0%	Baseline
+E3	Kubernetes	0 ms	0%	Baseline
+E4	Native	50 ms	0%	Retransmissions
+E5	Docker	50 ms	1%	Retransmissions
+E6	Kubernetes	50 ms	1%	Retransmissions
+E7	Kubernetes	100 ms	5%	Performance degradation
+🚀 The complete development roadmap
+
+I strongly recommend implementing the thesis in this exact order:
+
+Stage 1 — Foundation
+connect() monitoring
+        +
+Ring Buffer
+        +
+User-space loader
+
+⬇️
+
+Stage 2 — TCP State Monitoring
+SYN_SENT
+ESTABLISHED
+FIN_WAIT
+CLOSE
+
+⬇️
+
+Stage 3 — Retransmission Monitoring
+Packet loss
+     ↓
+TCP retransmission
+     ↓
+eBPF event
+
+⬇️
+
+Stage 4 — RTT Monitoring
+TCP metrics
+      ↓
+RTT
+Min RTT
+Average RTT
+
+⬇️
+
+Stage 5 — Throughput
+Bytes
+  ÷
+Time
+  =
+Throughput
+
+⬇️
+
+Stage 6 — CSV Data Collection
+eBPF
+ ↓
+User Program
+ ↓
+CSV
+ ↓
+Analysis
+
+⬇️
+
+Stage 7 — Docker
+Native Application
+        vs
+Container Application
+
+⬇️
+
+Stage 8 — Kubernetes
+Pod → Service → Pod
+
+⬇️
+
+Stage 9 — Variable Conditions
+Delay
+Loss
+Jitter
+Bandwidth
+
+⬇️
+
+Stage 10 — Thesis Evaluation
+Native
+   vs
+Docker
+   vs
+Kubernetes
+⚠️ One important recommendation before you start
+
+Let's not try to implement RTT, throughput, Kubernetes metadata, container identification, and network emulation all at once.
+
+The correct engineering approach is:
+
+First make the basic monitor compile and run successfully. Then add exactly one capability at a time.
+
+Your immediate first milestone should be:
+
+tcp_monitor.h
+        +
+tcp_monitor.bpf.c
+        +
+tcp_monitor.c
+        ↓
+Compile
+        ↓
+Attach successfully
+        ↓
+See CONNECT events
+        ↓
+See RETRANSMIT events
