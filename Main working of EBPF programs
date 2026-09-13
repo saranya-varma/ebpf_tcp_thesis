@@ -1,0 +1,977 @@
+hello.bpf.c             #your source code,This is the code you write
+   │
+   │ clang compiler
+   ▼
+hello.bpf.o             #compiled eBPF object.hello.bpf.o contains the compiled eBPF bytecode/instructions that will eventually be loaded into the kernel.
+   │
+   │ libbpf / loader    #a loader, such as your C/libbpf user-space program
+   ▼
+Linux Kernel
+   │
+   │ verifier checks it
+   ▼
+eBPF program loaded into kernel
+
+**************************************************************************************************************
+
+Example diagram :
+
+hello.bpf. c
+   │
+   │ libbpf
+   ▼
+hello.bpf.o
+   │
+   │ load into kernel
+   ▼
+Linux Kernel
+   │
+   ▼
+eBPF Verifier
+   │
+   ▼
+Attach to tracepoint
+The complete picture
+
+***************************************************************************************************************************
+
+
+                YOU WRITE
+                   │
+                   ▼
+             hello.bpf.c
+             C source code
+                   │
+                   │ clang
+                   ▼
+             hello.bpf.o
+       ELF object containing
+       compiled eBPF instructions
+                   │
+                   │ libbpf
+                   ▼
+              Linux Kernel
+                   │
+                   ▼
+             eBPF Verifier
+                   │
+            "Is this safe?"
+              /          \
+           YES            NO
+            │              │
+            ▼              ▼
+      Attach to hook      Reject
+            │
+            ▼
+       eBPF executes
+       in kernel space
+
+
+*****************************************************************************************************************************
+
+
+The complete flow
+1. hello.bpf.c               # eBPF kernel-side program.
+       │
+       │ clang               # Compile it
+       ▼
+2. hello.bpf.o               # contains the compiled eBPF instructions.
+       │                     
+       │ libbpf
+       ▼
+3. hello.skel.h              # Generate the skeleton. This is generated C code that makes it much easier for your user-space C program to work with hello.bpf.o.
+       │
+       │ used by
+       ▼
+4. hello.c                   # This is normal C code running in user space.
+       │
+       │ libbpf loads program
+       ▼
+5. Linux Kernel
+       │
+       ▼
+6. eBPF Verifier
+       │
+       ▼
+7. Attach to hook           # This tells libbpf where the program should attach.
+       │
+       ▼
+8. eBPF program waits for event
+       │
+       ▼
+9. Event occurs
+       │
+       ▼
+10. eBPF program executes
+
+
+
+hello.bpf.o
+      │
+      └── eBPF program
+          intended for kernel
+
+hello.c
+      │
+      └── normal C executable
+          running in user space
+
+*****************************************************************************************************************************
+
+
+So the entire journey is
+
+This is the picture I want you to remember:
+
+             USER SPACE
+────────────────────────────────────
+
+hello.bpf.c
+     │
+     │ clang
+     ▼
+hello.bpf.o
+     │
+     │ bpftool
+     ▼
+hello.skel.h
+     │
+     ▼
+hello.c
+     │
+     │ gcc
+     ▼
+hello
+     │
+     │ libbpf
+     │
+─────┼────────────────────────────────
+     │       KERNEL SPACE
+     ▼
+ Linux Kernel
+     │
+     ▼
+ eBPF Verifier
+     │
+     ▼
+ eBPF Program Loaded
+     │
+     ▼
+ Attach to Tracepoint
+     │
+     ▼
+ Wait for Event
+     │
+     │
+     │   User runs "ls"
+     │          ↓
+     │       execve()
+     │          ↓
+     ▼
+ eBPF program executes
+     │
+     ▼
+ bpf_printk()
+     │
+     ▼
+ Kernel trace buffer
+
+
+| File           | What it is                        | Where it runs             |
+| -------------- | --------------------------------- | ------------------------- |
+| `hello.bpf.c`  | eBPF source code                  | Compiled for kernel       |
+| `hello.bpf.o`  | Compiled eBPF object/instructions | Loaded into kernel        |
+| `hello.c`      | User-space loader                 | User space                |
+| `hello`        | Compiled loader executable        | User space                |
+| `hello.skel.h` | Generated helper C code           | Used by user-space loader |
+
+
+So the key idea is:
+
+hello.c does not become the eBPF program. hello.c is the user-space program that uses libbpf to take hello.bpf.o and load/attach the eBPF program into the kernel.
+
+
+
+
+******************************************************************************************************************************************************************
+
+
+1. hello.bpf.c — Why do we need this?
+hello.bpf.c
+What is it?
+
+This is the source code that you write for the eBPF program.
+
+For example:
+
+SEC("tracepoint/syscalls/sys_enter_execve")
+int hello(void *ctx)
+{
+    bpf_printk("Hello eBPF!\n");
+    return 0;
+}
+Why is it used?
+
+Because you need to tell the kernel:
+
+"What do I want to do when this particular kernel event happens?"
+
+For example:
+
+When execve() happens
+        ↓
+run my code
+        ↓
+print "Hello eBPF!"
+
+So hello.bpf.c is essentially your instructions for what the eBPF program should do.
+
+Why can't we skip it?
+
+Because something has to define the behavior of your eBPF program.
+
+You could write a different program, for example:
+
+Monitor TCP connections
+Monitor packets
+Monitor processes
+Monitor file access
+Monitor CPU usage
+Monitor system calls
+
+The .bpf.c file contains the logic for that.
+
+Simple analogy
+
+Think of hello.bpf.c as a recipe.
+
+hello.bpf.c
+     ↓
+Recipe:
+"When event X happens,
+do Y."
+2. clang — Why do we need it?
+hello.bpf.c
+     │
+     │ clang
+     ▼
+hello.bpf.o
+What is Clang?
+
+Clang is a C compiler.
+
+You write code that humans can understand:
+
+bpf_printk("Hello eBPF!");
+
+But the computer/kernel cannot directly execute your C source code.
+
+So Clang translates it into a form suitable for eBPF.
+
+Human-readable C
+       ↓
+     Clang
+       ↓
+eBPF instructions
+Why is it used?
+
+Because the kernel doesn't want:
+
+C source code
+
+It needs:
+
+compiled eBPF instructions
+
+That's the job of Clang.
+
+Very important
+
+For an eBPF program you typically use:
+
+clang -target bpf
+
+The important part is:
+
+-target bpf
+
+It tells Clang:
+
+"Compile this C program for the eBPF architecture."
+
+3. hello.bpf.o — Why do we need this?
+hello.bpf.o
+
+This is one of the most important files.
+
+What is it?
+
+It is the compiled eBPF object file.
+
+It contains things such as:
+
+eBPF instructions
+BTF/type information
+section information
+relocation information
+other metadata
+
+So:
+
+hello.bpf.c
+      ↓
+    clang
+      ↓
+hello.bpf.o
+Why is it used?
+
+Because the kernel cannot load your original C source directly.
+
+Instead, we give the loader the compiled eBPF object.
+
+Why not directly load hello.bpf.c?
+
+Because:
+
+hello.bpf.c
+
+is source code.
+
+The kernel needs the compiled representation.
+
+So:
+
+Source code
+     ↓
+Compiler
+     ↓
+Compiled object
+     ↓
+Loader
+     ↓
+Kernel
+Is hello.bpf.o eBPF bytecode?
+
+At a beginner level:
+
+Yes, you can think of it as containing the compiled eBPF bytecode/instructions.
+
+More precisely, it is an ELF object file containing eBPF instructions plus metadata.
+
+4. bpftool — Why do we need it here?
+
+Next:
+
+hello.bpf.o
+     │
+     │ bpftool
+     ▼
+hello.skel.h
+What is bpftool?
+
+bpftool is a command-line utility for working with BPF/eBPF.
+
+It can do many things:
+
+inspect BPF programs
+inspect maps
+inspect links
+inspect BTF
+generate skeletons
+show loaded programs
+etc.
+
+In this particular step, we're using it to generate a skeleton.
+
+For example:
+
+bpftool gen skeleton hello.bpf.o > hello.skel.h
+5. hello.skel.h — Why do we need it?
+
+This is probably the most confusing part for beginners.
+
+hello.skel.h
+
+is a generated C header file.
+
+It is created from:
+
+hello.bpf.o
+
+using:
+
+bpftool
+Why?
+
+Because your user-space C program needs an easy way to interact with the eBPF program.
+
+Without the skeleton, you'd have to write more low-level libbpf code yourself.
+
+The skeleton gives your user-space program convenient functions for things like:
+
+Open the eBPF object
+Load it
+Attach it
+Access maps
+Detach it
+Destroy it
+
+Conceptually:
+
+hello.bpf.o
+     ↓
+ bpftool
+     ↓
+hello.skel.h
+     ↓
+hello.c
+Simple analogy
+
+Imagine hello.bpf.o is a machine.
+
+The skeleton is like a remote-control interface for that machine.
+
+Instead of manually controlling every internal component, your hello.c program can use convenient functions.
+
+6. hello.c — Why do we need another C file?
+
+This is extremely important.
+
+You already have:
+
+hello.bpf.c
+
+Why do you need:
+
+hello.c
+
+?
+
+Because they have different jobs.
+
+hello.bpf.c
+
+This is the eBPF program.
+
+It eventually runs in:
+
+KERNEL SPACE
+
+Its job is:
+
+"What should I do when the kernel event happens?"
+
+hello.c
+
+This is a normal user-space C program.
+
+Its job is:
+
+"Take my eBPF program and load/manage it in the kernel."
+
+So:
+
+hello.bpf.c
+      ↓
+WHAT THE EBPF PROGRAM DOES
+
+while:
+
+hello.c
+      ↓
+MANAGES THE EBPF PROGRAM
+
+This distinction is fundamental.
+
+7. Why does hello.c need the skeleton?
+
+Because we typically write:
+
+#include "hello.skel.h"
+
+Now hello.c can use the functions generated by the skeleton.
+
+For example:
+
+skel = hello_bpf__open_and_load();
+
+and:
+
+hello_bpf__attach(skel);
+
+So:
+
+hello.c
+   ↓
+hello.skel.h
+   ↓
+libbpf
+   ↓
+hello.bpf.o
+   ↓
+Linux kernel
+8. gcc — Why do we need it?
+
+Now:
+
+hello.c
+   │
+   │ gcc
+   ▼
+hello
+What is GCC?
+
+GCC is another C compiler.
+
+It compiles your user-space C program.
+
+This is different from compiling hello.bpf.c.
+
+Remember:
+
+hello.bpf.c
+     ↓
+clang -target bpf
+     ↓
+hello.bpf.o
+
+But:
+
+hello.c
+     ↓
+gcc
+     ↓
+hello
+
+Why?
+
+Because hello.c is a normal user-space C program, not an eBPF program.
+
+9. hello — What is this?
+
+After GCC:
+
+hello
+
+is the executable program you can run:
+
+sudo ./hello
+
+This program runs in:
+
+USER SPACE
+
+Its job is to control/load the eBPF program.
+
+Think:
+
+hello
+  ↓
+"I am the manager."
+
+while:
+
+hello.bpf.o
+  ↓
+"I am the eBPF program."
+10. libbpf — Why do we need it?
+
+Now we reach a very important component:
+
+hello
+   │
+   │ libbpf
+   ▼
+Linux Kernel
+What is libbpf?
+
+libbpf is a C library for working with eBPF.
+
+It makes it much easier for your user-space C program to:
+
+open eBPF objects
+load programs
+attach programs
+manage maps
+manage links
+handle BTF
+etc.
+Why is it needed?
+
+Your normal user-space program cannot simply say:
+
+"Kernel, please run this eBPF program."
+
+It needs to communicate with the kernel using Linux's BPF mechanisms/system calls.
+
+libbpf handles much of that complexity for you.
+
+So:
+
+hello.c
+   ↓
+libbpf
+   ↓
+Linux kernel
+Simple analogy
+
+Think of:
+
+hello.c = you
+Linux kernel = another country
+libbpf = translator
+
+Your C program says:
+
+"Load this eBPF program."
+
+libbpf translates that request into the appropriate kernel operations.
+
+11. Linux Kernel — Why does the eBPF program go here?
+
+This is the whole reason we're using eBPF.
+
+The eBPF program needs to observe things that happen inside the operating system.
+
+For example:
+
+system calls
+processes
+network packets
+TCP connections
+file access
+CPU activity
+network interfaces
+
+These things happen in or through the Linux kernel.
+
+So eBPF programs are designed to run in kernel space.
+
+USER SPACE
+    │
+    │ libbpf
+    ▼
+KERNEL SPACE
+    │
+    ▼
+eBPF
+12. eBPF Verifier — Why is this needed?
+
+This is one of the most important safety mechanisms.
+
+When your program arrives at the kernel, the kernel doesn't simply say:
+
+"Sure, run whatever code you gave me."
+
+Instead:
+
+eBPF program
+     ↓
+Verifier
+
+The verifier asks:
+
+"Is this program safe to run inside the kernel?"
+
+Why is this necessary?
+
+Because kernel code is powerful.
+
+A badly written program running unrestricted in the kernel could potentially:
+
+crash the system
+corrupt memory
+access invalid memory
+cause security problems
+
+So Linux checks the eBPF program before allowing it to run.
+
+Simple analogy
+
+Imagine airport security:
+
+You
+ ↓
+Airport security
+ ↓
+Safe?
+ ↓
+YES → allowed inside
+NO  → rejected
+
+Similarly:
+
+eBPF program
+      ↓
+eBPF verifier
+      ↓
+safe?
+  ↙       ↘
+YES       NO
+ ↓         ↓
+load      reject
+13. eBPF Program Loaded — What does "loaded" mean?
+
+If the verifier accepts the program:
+
+Verifier
+    ↓
+PASS
+    ↓
+eBPF program loaded
+
+This means the kernel has accepted the eBPF program and prepared it for execution.
+
+But loaded doesn't necessarily mean "executing right now."
+
+This is an important distinction.
+
+Think:
+
+Loaded = program is installed/available in the kernel
+
+but:
+
+Executing = an event caused the program to run
+14. Attach to Tracepoint — Why do we need this?
+
+Your eBPF program needs to know:
+
+"When should I run?"
+
+That's what attachment provides.
+
+Your code might contain:
+
+SEC("tracepoint/syscalls/sys_enter_execve")
+
+This means:
+
+Attach me to:
+sys_enter_execve
+
+So:
+
+eBPF program
+     │
+     │ attach
+     ▼
+sys_enter_execve
+15. What is the purpose of a tracepoint?
+
+A tracepoint is basically a predefined observation point inside the kernel.
+
+For example:
+
+Linux kernel
+────────────────────────
+
+Process
+   ↓
+execve()
+   ↓
+[ sys_enter_execve ] ← tracepoint
+   ↓
+continue execution
+
+You put your eBPF program at that observation point.
+
+So you can say:
+
+"Whenever the kernel reaches this point, run my eBPF program."
+
+16. Why don't we just run the eBPF program continuously?
+
+Because that would be wasteful.
+
+Imagine you want to monitor TCP connections.
+
+You don't want your program constantly doing:
+
+check TCP
+check TCP
+check TCP
+check TCP
+check TCP
+...
+
+Instead, you attach to an event:
+
+TCP event happens
+       ↓
+eBPF executes
+
+This is much more efficient.
+
+17. Wait for Event — What does this mean?
+
+After attaching:
+
+eBPF program
+     ↓
+attached
+     ↓
+WAIT
+
+The eBPF program isn't constantly running.
+
+It waits for its associated event.
+
+For our example:
+
+sys_enter_execve
+
+So it waits for a process to execute a program.
+
+18. User runs ls — Why is this important?
+
+Suppose you type:
+
+ls
+
+You might think:
+
+I typed ls
+     ↓
+ls runs
+
+But internally, Linux does much more.
+
+The shell asks Linux to execute the program.
+
+One of the system calls involved is:
+
+execve()
+
+So:
+
+You type ls
+     ↓
+Shell
+     ↓
+execve()
+     ↓
+Linux kernel
+19. execve() — What is it?
+
+execve() is a Linux system call used to execute a program.
+
+Conceptually:
+
+"Please replace the current process
+with this program."
+
+For example:
+
+bash
+  ↓
+execve("/usr/bin/ls")
+  ↓
+ls starts
+20. sys_enter_execve — What happens here?
+
+When the process enters the execve system call:
+
+execve()
+   ↓
+sys_enter_execve
+
+our tracepoint is triggered.
+
+And because we attached our eBPF program there:
+
+sys_enter_execve
+       ↓
+YOUR eBPF PROGRAM
+21. eBPF program executes
+
+Now the eBPF program finally runs.
+
+For example:
+
+int hello(void *ctx)
+{
+    bpf_printk("Hello eBPF!\n");
+
+    return 0;
+}
+
+The kernel invokes it:
+
+Event occurs
+     ↓
+Tracepoint
+     ↓
+eBPF program
+     ↓
+hello()
+22. bpf_printk() — Why is it used?
+
+Your eBPF program needs some way to produce output for debugging.
+
+That's where:
+
+bpf_printk()
+
+comes in.
+
+eBPF program
+      ↓
+bpf_printk()
+      ↓
+kernel tracing system
+
+It is particularly useful while learning and debugging.
+
+However, for your eventual TCP thesis, you generally won't use bpf_printk() for high-volume monitoring data. You'll learn to use mechanisms such as:
+
+BPF maps
+Ring buffers
+Perf buffers
+
+because they're much more appropriate for sending structured monitoring data to user space.
+
+23. Kernel trace buffer — Why is it used?
+
+The message from:
+
+bpf_printk("Hello eBPF!");
+
+needs somewhere to go.
+
+It goes through the kernel's tracing infrastructure.
+
+Conceptually:
+
+eBPF
+  ↓
+bpf_printk()
+  ↓
+kernel tracing buffer
+  ↓
+trace_pipe
+  ↓
+terminal
+
+You can observe it with:
+
+sudo cat /sys/kernel/debug/tracing/trace_pipe
+24. Why do we need the trace buffer?
+
+Because the eBPF program is running in kernel space, while you are looking at the result from user space.
+
+The trace buffer provides a way to observe the debugging output.
+
+Think:
+
+KERNEL SPACE
+     │
+     │ bpf_printk()
+     ▼
+trace buffer
+     │
+     ▼
+USER SPACE
+     │
+     ▼
+terminal
